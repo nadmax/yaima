@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     errors::{AppError, AppResult},
-    models::{Claims, Role},
+    models::{AuthMethod, Claims, Role},
 };
 
 /// Minimal projection of a `refresh_tokens` row.
@@ -49,8 +49,9 @@ impl TokenService {
         &self,
         user_id: Uuid,
         email: &str,
-        username: &str,
+        display_name: &str,
         role: Role,
+        auth_method: AuthMethod,
     ) -> AppResult<String> {
         let now = unix_now();
         let claims = Claims {
@@ -58,8 +59,9 @@ impl TokenService {
             iat: now,
             exp: now + self.config.access_token_expiry_secs,
             email: email.to_owned(),
-            username: username.to_owned(),
+            display_name: display_name.to_owned(),
             role,
+            auth_method,
         };
         encode(
             &Header::default(),

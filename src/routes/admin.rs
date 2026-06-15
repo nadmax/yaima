@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     errors::AppResult,
     middleware::RequireAdmin,
-    models::{UpdateRoleRequest, UserResponse},
+    models::{UpdateRoleRequest, UserResponse, UserView},
     services::admin::AdminService,
     state::AppState,
 };
@@ -51,5 +51,10 @@ pub async fn update_user_role(
         .update_user_role(claims.sub, target_id, req.role)
         .await?;
 
-    Ok(Json(user.into()))
+    let credential = state.user.find_local_credential(user.id).await?;
+
+    Ok(Json(UserResponse::from(UserView {
+        user,
+        local_credential: credential,
+    })))
 }

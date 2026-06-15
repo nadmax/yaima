@@ -1,9 +1,18 @@
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::Redirect,
+    routing::{get, post},
+};
+use serde::Deserialize;
 
 use crate::{
-    errors::AppResult,
+    config::OAuthProvider,
+    errors::{AppError, AppResult, OAuthError},
     middleware::AuthUser,
     models::{AuthResponse, LoginRequest, MessageResponse, RefreshRequest, RegisterRequest},
+    services::oauth,
     state::AppState,
 };
 
@@ -14,6 +23,8 @@ pub fn router() -> Router<AppState> {
         .route("/auth/login", post(login))
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
+        .route("/auth/{provider}", get(authorize))
+        .route("/auth/{provider}/callback", get(callback))
 }
 
 /// Register a new user account.
@@ -118,4 +129,144 @@ pub async fn logout(
 
     tracing::info!(user_id = %claims.sub, "user logged out");
     Ok(Json(MessageResponse::new("Logged out successfully")))
+}
+
+/// Redirect the user to the provider's consent screen.
+///
+/// Resolves the provider slug, builds the PKCE authorization URL, and issues a
+/// `302 Found` to the provider. The PKCE verifier and CSRF state are stored
+/// server-side in [`AppState::oauth_store`] until the callback arrives.
+///
+/// # Errors
+///
+/// Returns `404 Not Found` for unrecognised provider slugs and
+/// `503 Service Unavailable` when the provider is recognised but its
+/// credentials are not present in the server configuration.
+#[utoipa::path(
+    get,
+    path = "/auth/{provider}",
+    tag  = "auth",
+    params(("provider" = String, Path, description = "OAuth provider slug (e.g. `google`, `github`)")),
+    responses(
+        (status = 302, description = "Redirect to provider consent screen"),
+        (status = 404, description = "Unknown provider",         body = serde_json::Value),
+        (status = 503, description = "Provider not configured",  body = serde_json::Value),
+    )
+)]
+pub async fn authorize(
+    Path(slug): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Redirect> {
+    let provider = resolve_provider(&slug)?;
+
+    let provider_cfg = state
+        .config
+        .oauth
+        .provider(provider)
+        .ok_or(OAuthError::ProviderNotConfigured(provider))?;
+
+    let auth_request =
+        oauth::build_authorization_url(provider, provider_cfg, &state.oauth_store).await?;
+
+    tracing::debug!(%provider, "redirecting to OAuth consent screen");
+    Ok(Redirect::to(auth_request.url.as_str()))
+}
+
+/// Query parameters echoed back by the provider on the callback redirect.
+#[derive(Debug, Deserialize)]
+pub struct CallbackParams {
+    /// The authorization code to exchange for tokens.
+    code: Option<String>,
+    /// The opaque CSRF state token that was round-tripped through the provider.
+    state: Option<String>,
+    /// Set by the provider when the user denied consent or an error occurred.
+    error: Option<String>,
+    /// Human-readable description accompanying `error`, when present.
+    error_description: Option<String>,
+}
+
+/// Handle the provider callback, issue an application JWT on success.
+///
+/// Steps:
+/// 1. Surface any provider-reported error (e.g. `access_denied`) immediately.
+/// 2. Validate the CSRF `state` and consume the stored PKCE verifier.
+/// 3. Exchange the authorization code for a provider access token.
+/// 4. Fetch and normalise the user profile.
+/// 5. Find or create a local account and link the `OAuthAccount` relation.
+/// 6. Issue an application JWT using the existing `services/token` logic.
+///
+/// # Errors
+///
+/// Returns `400 Bad Request` for missing parameters or provider-reported
+/// errors, `401 Unauthorized` for CSRF/PKCE failures, and `502 Bad Gateway`
+/// when the provider is unreachable.
+#[utoipa::path(
+    get,
+    path = "/auth/{provider}/callback",
+    tag  = "auth",
+    params(
+        ("provider"          = String, Path,  description = "OAuth provider slug"),
+        ("code"              = String, Query, description = "Authorization code from the provider"),
+        ("state"             = String, Query, description = "CSRF state token"),
+        ("error"             = Option<String>, Query, description = "Provider error code, if any"),
+        ("error_description" = Option<String>, Query, description = "Provider error detail, if any"),
+    ),
+    responses(
+        (status = 302, description = "Login successful — redirect to application"),
+        (status = 400, description = "Provider denied access or missing params", body = serde_json::Value),
+        (status = 401, description = "CSRF / PKCE validation failed",            body = serde_json::Value),
+        (status = 404, description = "Unknown provider",                         body = serde_json::Value),
+        (status = 502, description = "Provider unreachable",                     body = serde_json::Value),
+    )
+)]
+pub async fn callback(
+    Path(slug): Path<String>,
+    Query(params): Query<CallbackParams>,
+    State(state): State<AppState>,
+) -> AppResult<Redirect> {
+    if let Some(error) = params.error {
+        let detail = params
+            .error_description
+            .unwrap_or_else(|| "no detail provided".to_owned());
+        tracing::warn!(%error, %detail, "OAuth provider returned an error");
+        return Err(OAuthError::ProviderDenied { error, detail }.into());
+    }
+
+    let code = params.code.ok_or(OAuthError::InvalidState)?;
+    let csrf_state = params.state.ok_or(OAuthError::InvalidState)?;
+
+    let provider = resolve_provider(&slug)?;
+
+    let provider_cfg = state
+        .config
+        .oauth
+        .provider(provider)
+        .ok_or(OAuthError::ProviderNotConfigured(provider))?;
+
+    let access_token = oauth::exchange_code(
+        provider,
+        provider_cfg,
+        &code,
+        &csrf_state,
+        &state.oauth_store,
+    )
+    .await?;
+
+    let profile = oauth::fetch_user_profile(provider, &access_token).await?;
+    let response = state.auth.login_or_register_oauth(&profile).await?;
+
+    tracing::info!(
+        user_id = %response.user.id,
+        %provider,
+        "user authenticated via OAuth",
+    );
+
+    let redirect_url = format!("/auth/success?token={}", response.access_token);
+    Ok(Redirect::to(&redirect_url))
+}
+
+/// Resolve a URL path segment to an [`OAuthProvider`], or return `404`.
+fn resolve_provider(slug: &str) -> AppResult<OAuthProvider> {
+    OAuthProvider::from_slug(slug)
+        .ok_or_else(|| AppError::OAuth(OAuthError::UnknownProvider(slug.to_owned())))
 }

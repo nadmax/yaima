@@ -5,7 +5,7 @@ use axum::{
 
 use crate::{
     errors::{AppError, AppResult},
-    models::{Claims, Role},
+    models::{AuthMethod, Claims, Role},
     state::AppState,
 };
 
@@ -76,9 +76,43 @@ where
     }
 }
 
+/// Requires the token to have been issued via an OAuth 2.0 provider.
+///
+/// Use on endpoints that are only meaningful for OAuth sessions — for example,
+/// listing or unlinking a connected provider identity (`GET /auth/connections`,
+/// `DELETE /auth/connections/{provider}`).
+///
+/// Returns `401` if the token is absent or invalid, `403` if it was issued
+/// via password login.
+pub struct RequireOAuthSession(pub Claims);
+
+impl<S> FromRequestParts<S> for RequireOAuthSession
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let AuthUser(claims) = AuthUser::from_request_parts(parts, state).await?;
+        require_auth_method(&claims, AuthMethod::OAuth)?;
+        Ok(RequireOAuthSession(claims))
+    }
+}
+
 /// Return `Err(AppError::Forbidden)` if the claims do not meet the minimum role.
 fn require_role(claims: &Claims, minimum: Role) -> AppResult<()> {
     if claims.role.is_at_least(minimum) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden)
+    }
+}
+
+/// Return `Err(AppError::Forbidden)` if the token was not issued via the
+/// expected authentication method.
+fn require_auth_method(claims: &Claims, expected: AuthMethod) -> AppResult<()> {
+    if claims.auth_method == expected {
         Ok(())
     } else {
         Err(AppError::Forbidden)

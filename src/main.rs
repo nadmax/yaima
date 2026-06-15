@@ -12,6 +12,7 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::services::oauth::StateStore;
 use config::Config;
 use services::{auth::AuthService, token::TokenService, user::UserService};
 use state::AppState;
@@ -28,6 +29,8 @@ use state::AppState;
         routes::auth::login,
         routes::auth::refresh,
         routes::auth::logout,
+        routes::auth::authorize,
+        routes::auth::callback,
         routes::users::get_me,
         routes::users::change_password,
         routes::users::deactivate_account,
@@ -49,7 +52,7 @@ use state::AppState;
     ),
     modifiers(&BearerSecurityAddon),
     tags(
-        (name = "auth",  description = "Register / login / refresh / logout"),
+        (name = "auth",  description = "Authentication operations"),
         (name = "users", description = "Authenticated user operations"),
         (name = "admin", description = "Admin-only operations (requires admin role)"),
         (name = "system", description = "Liveness and infrastructure endpoints"),
@@ -99,7 +102,10 @@ async fn main() -> anyhow::Result<()> {
     let user = UserService::new(pool.clone());
     let token = TokenService::new(pool.clone(), config.clone());
     let auth = AuthService::new(user.clone(), token.clone(), config.clone());
-    let state = AppState::new(auth, user, token);
+    let oauth_store = StateStore::new(&config.redis_url)
+        .expect("failed to create OAuth state store")
+        .shared();
+    let state = AppState::new(auth, user, token, config.clone(), oauth_store);
     let app = Router::new()
         .route("/health", get(health))
         .merge(routes::auth::router())

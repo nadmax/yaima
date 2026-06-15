@@ -7,7 +7,7 @@ use axum::{
 use crate::{
     errors::AppResult,
     middleware::RequireUser,
-    models::{ChangePasswordRequest, MessageResponse, UserResponse},
+    models::{ChangePasswordRequest, MessageResponse, UserResponse, UserView},
     state::AppState,
 };
 
@@ -40,7 +40,12 @@ pub async fn get_me(
     RequireUser(claims): RequireUser,
 ) -> AppResult<Json<UserResponse>> {
     let user = state.user.find_by_id(claims.sub).await?;
-    Ok(Json(user.into()))
+    let credential = state.user.find_local_credential(user.id).await?;
+
+    Ok(Json(UserResponse::from(UserView {
+        user,
+        local_credential: credential,
+    })))
 }
 
 /// Change the authenticated user's password.

@@ -75,10 +75,10 @@ JWT_SECRET=your-secret-at-least-32-characters
 ```
 
 4. Start dependencies
-Start the PostgreSQL container:
+Start Postgres and Redis containers:
 
 ```sh
-make docker-db
+make docker-up
 ```
 
 5. Run database migrations

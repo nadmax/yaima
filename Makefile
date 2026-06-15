@@ -46,15 +46,6 @@ docker-up:
 docker-down:
 	@docker compose down
 
-## docker-db: Start only the database service
-docker-db:
-	@docker compose up -d db
-
-## docker-db-reset: Wipe all volumes and restart the database
-docker-db-reset:
-	@docker compose down -v
-	@docker compose up -d db
-
 ## migrate: Run all pending migrations
 migrate:
 	@sqlx migrate run
